@@ -37,6 +37,8 @@ class GPTConfig:
     # Characters: L=long (full context), S=short (quarter context)
     # Examples: "L"=all full context, "SL"=alternating, "SSL"=two short then one long
     window_pattern: str = "SSSL"
+    # Bidirectional attention (no causal mask) for diffusion language models (UDLM branch)
+    bidirectional: bool = False
 
 
 def norm(x):
@@ -104,10 +106,12 @@ class CausalSelfAttention(nn.Module):
         k = k * 1.2
 
         # Flash Attention (FA3 or SDPA fallback)
-        # window_size is (left, right) tuple: (N, 0) for causal, (-1, 0) for full context
+        # window_size is (left, right) tuple: (N, 0) for causal, (-1, 0) for full context,
+        # (-1, -1) for bidirectional (unmasked) attention used by diffusion training
         if kv_cache is None:
-            # Training: causal attention with optional sliding window
-            y = flash_attn.flash_attn_func(q, k, v, causal=True, window_size=window_size)
+            # Training: causal attention with optional sliding window (or bidirectional for UDLM)
+            causal = window_size != (-1, -1)
+            y = flash_attn.flash_attn_func(q, k, v, causal=causal, window_size=window_size)
         else:
             # Inference: use flash_attn_with_kvcache which handles cache management
             k_cache, v_cache = kv_cache.get_layer_cache(self.layer_idx)
@@ -295,6 +299,9 @@ class GPT(nn.Module):
         Pattern string is tiled across layers. Final layer always gets L (full context).
         Characters: L=long (full context), S=short (quarter context)
         """
+        if config.bidirectional:
+            # UDLM: every layer attends to the full sequence in both directions (no causal mask)
+            return [(-1, -1)] * config.n_layer
         pattern = config.window_pattern.upper()
         assert all(c in "SL" for c in pattern), f"Invalid window_pattern: {pattern}. Use only S and L."
         # Map characters to window sizes

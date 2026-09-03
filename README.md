@@ -107,6 +107,16 @@ See an example [here](https://github.com/karpathy/nanochat/pull/498#issuecomment
 
 The important thing to note is that nanochat is written and configured around one single dial of complexity - the depth of the transformer. This single integer automatically determines all other hyperparameters (the width of the transformer, number of heads, learning rate adjustments, training horizons, weight decays, ...) so that the trained model comes out compute optimal. The idea is that the user doesn't have to think about or set any of this, they are simply asking for a smaller or bigger model using `--depth`, and everything "just works". By sweeping out the depth, you achieve the nanochat miniseries of compute optimal models at various sizes. GPT-2 capability model (which is of most interest at the moment) happens to be somewhere around d24-d26 range with the current code. But any candidate changes to the repo have to be principled enough that they work for all settings of depth.
 
+## Uniform diffusion (UDLM)
+
+This `UDLM` branch can also pretrain a **uniform diffusion language model**, following the recipe of [Sumi](https://huggingface.co/tohoku-nlp/sumi-7b) ([arXiv:2606.19005](https://arxiv.org/abs/2606.19005)) — GIDD ([von Rütte et al. 2025](https://openreview.net/forum?id=rvZv7sDPV9)) in its SNR-reparameterized form ([von Rütte et al. 2026](https://arxiv.org/abs/2512.10858)) under pure uniform noise:
+
+- The model is the same nanochat GPT with causal attention masking removed (`GPTConfig(bidirectional=True)`); it is **time-agnostic** — the diffusion time never enters the model, only the loss.
+- **No mask token and no vocab changes**: corruption replaces tokens with uniform draws from the existing vocabulary (with probability `t`, `t ~ U[sigmoid(-9), sigmoid(9)]` i.e. log-SNR λ∈[-9,9]); 50% of sequences get one isotropic time, 50% get independent per-token times.
+- The loss is the GIDD per-token ELBO (`w·KL + w·Itakura-Saito`) plus a `1e-5` z-loss — see [nanochat/udlm.py](nanochat/udlm.py). The optimizer stack (Muon+AdamW), batch/LR scaling and schedules are unchanged from `base_train.py`.
+
+Train as `torchrun --nproc_per_node=8 -m scripts.udlm_train` (same flags as `base_train`; the val metric is `val/nelbo`, diffusion nats/token, which is not comparable to autoregressive `val_bpb`). Note the GIDD loss holds softmax+log over `(B, T, V)` in fp32 (~1.5× the logits memory of AR cross-entropy) — lower `--device-batch-size` if you OOM. There is no generation sampler or post-training yet.
+
 ## Running on CPU / MPS
 
 The script [runs/runcpu.sh](runs/runcpu.sh) shows a very simple example of running on CPU or Apple Silicon. It dramatically shrinks the LLM that is being trained to make things fit into a reasonable time interval of a few ten minutes of training. You will not get strong results in this way.

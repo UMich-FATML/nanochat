@@ -69,6 +69,20 @@ class TestFA3VsSDPA:
         max_diff, mean_diff = assert_close(y_fa3, y_sdpa, "basic_causal")
         print(f"basic_causal: max_diff={max_diff:.6f}, mean_diff={mean_diff:.6f}")
 
+    def test_noncausal_bidirectional(self):
+        """Bidirectional (non-causal) full-context attention, as used by UDLM training."""
+        B, T, H, D = 2, 128, 4, 32
+        q = torch.randn(B, T, H, D, device=self.DEVICE, dtype=self.DTYPE)
+        k = torch.randn(B, T, H, D, device=self.DEVICE, dtype=self.DTYPE)
+        v = torch.randn(B, T, H, D, device=self.DEVICE, dtype=self.DTYPE)
+
+        def run():
+            return flash_attn.flash_attn_func(q, k, v, causal=False, window_size=(-1, -1))
+
+        y_fa3, y_sdpa = run_both_impls(run)
+        max_diff, mean_diff = assert_close(y_fa3, y_sdpa, "noncausal_bidirectional")
+        print(f"noncausal_bidirectional: max_diff={max_diff:.6f}, mean_diff={mean_diff:.6f}")
+
     def test_full_context(self):
         """Full context (window_size=-1)."""
         B, T, H, D = 2, 128, 4, 32
@@ -269,6 +283,27 @@ class TestSDPAOnly:
 
         assert y.shape == (B, T, H, D)
         assert not torch.isnan(y).any(), "Output contains NaN"
+        set_impl(None)
+
+    def test_noncausal_matches_manual_reference(self):
+        """SDPA non-causal attention must match a manual full-attention computation."""
+        set_impl('sdpa')
+        B, T, H, D = 2, 64, 4, 32
+        q = torch.randn(B, T, H, D, device=self.DEVICE, dtype=self.DTYPE)
+        k = torch.randn(B, T, H, D, device=self.DEVICE, dtype=self.DTYPE)
+        v = torch.randn(B, T, H, D, device=self.DEVICE, dtype=self.DTYPE)
+
+        y = flash_attn.flash_attn_func(q, k, v, causal=False, window_size=(-1, -1))
+
+        # manual reference: full bidirectional attention (fp32)
+        qh = q.transpose(1, 2).float()  # (B, H, T, D)
+        kh = k.transpose(1, 2).float()
+        vh = v.transpose(1, 2).float()
+        attn = torch.softmax(qh @ kh.transpose(-2, -1) / (D ** 0.5), dim=-1)
+        y_ref = (attn @ vh).transpose(1, 2)  # (B, T, H, D)
+
+        assert torch.allclose(y.float(), y_ref, atol=1e-2, rtol=1e-2), \
+            f"max diff: {(y.float() - y_ref).abs().max().item():.6f}"
         set_impl(None)
 
     def test_backward(self):
