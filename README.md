@@ -115,7 +115,7 @@ This `UDLM` branch can also pretrain a **uniform diffusion language model**, fol
 - **No mask token and no vocab changes**: corruption replaces tokens with uniform draws from the existing vocabulary (with probability `t`, `t ~ U[sigmoid(-9), sigmoid(9)]` i.e. log-SNR λ∈[-9,9]); 50% of sequences get one isotropic time, 50% get independent per-token times.
 - The loss is the GIDD per-token ELBO (`w·KL + w·Itakura-Saito`) plus a `1e-5` z-loss — see [nanochat/udlm.py](nanochat/udlm.py). The optimizer stack (Muon+AdamW), batch/LR scaling and schedules are unchanged from `base_train.py`.
 
-Train as `torchrun --nproc_per_node=8 -m scripts.udlm_train` (same flags as `base_train`; the val metric is `val/nelbo`, diffusion nats/token, which is not comparable to autoregressive `val_bpb`). Note the GIDD loss holds softmax+log over `(B, T, V)` in fp32 (~1.5× the logits memory of AR cross-entropy) — lower `--device-batch-size` if you OOM. There is no generation sampler or post-training yet.
+Train as `torchrun --nproc_per_node=8 -m scripts.udlm_train` (same flags as `base_train`). Validation reports `val/loss`, the training objective on validation rows, and `val/bpb`, the negative ELBO in bits per byte: the per-token loss divided by `t(1-t)` restores the continuous-time NELBO weight of GIDD, so `val/bpb` is an upper bound on the negative log-likelihood and directly comparable to `val_bpb` of `base_train` (one noise level per row on a seeded stratified grid, z-loss excluded, same byte accounting as `evaluate_bpb`). Note the GIDD loss holds softmax+log over `(B, T, V)` in fp32 (~1.5× the logits memory of AR cross-entropy) — lower `--device-batch-size` if you OOM. There is no generation sampler or post-training yet.
 
 ## Running on CPU / MPS
 

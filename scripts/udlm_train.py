@@ -35,7 +35,7 @@ import torch.distributed as dist
 from nanochat.gpt import GPT, GPTConfig, Linear
 from nanochat.dataloader import tokenizing_distributed_data_loader_bos_bestfit, tokenizing_distributed_data_loader_with_state_bos_bestfit
 from nanochat.common import compute_init, compute_cleanup, print0, DummyWandb, print_banner, get_base_dir, autodetect_device_type, get_peak_flops, COMPUTE_DTYPE, COMPUTE_DTYPE_REASON, is_ddp_initialized
-from nanochat.tokenizer import get_tokenizer
+from nanochat.tokenizer import get_tokenizer, get_token_bytes
 from nanochat.checkpoint_manager import save_checkpoint, load_checkpoint
 from nanochat.flash_attention import HAS_FA3
 import nanochat.udlm as udlm
@@ -77,7 +77,7 @@ parser.add_argument("--warmdown-ratio", type=float, default=0.65, help="ratio of
 parser.add_argument("--final-lr-frac", type=float, default=0.05, help="final LR as fraction of initial LR")
 parser.add_argument("--resume-from-step", type=int, default=-1, help="resume training from this step (-1 = disable)")
 # Evaluation
-parser.add_argument("--eval-every", type=int, default=250, help="evaluate val nelbo every N steps (-1 = disable)")
+parser.add_argument("--eval-every", type=int, default=250, help="evaluate val loss and bpb every N steps (-1 = disable)")
 parser.add_argument("--eval-tokens", type=int, default=80*524288, help="number of tokens to evaluate val loss on")
 parser.add_argument("--save-every", type=int, default=-1, help="save checkpoints every N steps (-1 = only at end)")
 # Output
@@ -119,10 +119,11 @@ else:
     print0("!" * 80)
 
 # -----------------------------------------------------------------------------
-# Tokenizer: we need the vocab size to init the model
+# Tokenizer: we need the vocab size to init the model, and the token byte counts for val bpb
 # Note: the vocab is unchanged from the AR model - uniform diffusion needs no mask token,
 # as corruption is uniform replacement over the existing vocabulary (Sumi/GIDD-style).
 tokenizer = get_tokenizer()
+token_bytes = get_token_bytes(device=device)
 vocab_size = tokenizer.get_vocab_size()
 print0(f"Vocab size: {vocab_size:,}")
 
@@ -396,15 +397,15 @@ def get_weight_decay(it):
 # Loop state (variables updated by the training loop)
 if not resuming:
     step = 0
-    val_nelbo = None # will be set if eval_every > 0
-    min_val_nelbo = float("inf")
+    val_loss, val_bpb = None, None # will be set if eval_every > 0
+    min_val_bpb = float("inf")
     smooth_train_loss = 0 # EMA of training loss
     total_training_time = 0 # total wall-clock time of training
 else:
     step = meta_data["step"]
     loop_state = meta_data["loop_state"]
-    val_nelbo = meta_data["val_nelbo"]
-    min_val_nelbo = loop_state["min_val_nelbo"]
+    val_loss, val_bpb = meta_data["val_loss"], meta_data["val_bpb"]
+    min_val_bpb = loop_state["min_val_bpb"]
     smooth_train_loss = loop_state["smooth_train_loss"]
     total_training_time = loop_state["total_training_time"]
 
@@ -422,21 +423,22 @@ while True:
     last_step = step == num_iterations # loop runs num_iterations+1 times so that we can eval/save at the end
     flops_so_far = num_flops_per_token * total_batch_size * step
 
-    # once in a while: evaluate the val nelbo (all ranks participate)
+    # once in a while: evaluate the val loss and val bpb (all ranks participate)
     if args.eval_every > 0 and (last_step or step % args.eval_every == 0):
         model.eval()
         val_loader = build_val_loader()
         eval_steps = args.eval_tokens // (args.device_batch_size * args.max_seq_len * ddp_world_size)
         with disable_fp8(model):
-            val_nelbo = udlm.evaluate_nelbo(model, val_loader, eval_steps, vocab_size, args.beta_is, args.z_loss_strength, args.aniso_frac)
-        print0(f"Step {step:05d} | Validation nelbo: {val_nelbo:.6f}")
-        if val_nelbo < min_val_nelbo:
-            min_val_nelbo = val_nelbo
+            val_loss, val_bpb = udlm.evaluate_loss_bpb(model, val_loader, eval_steps, vocab_size, token_bytes, args.beta_is, args.z_loss_strength)
+        print0(f"Step {step:05d} | Validation loss: {val_loss:.6f} | Validation bpb: {val_bpb:.6f}")
+        if val_bpb < min_val_bpb:
+            min_val_bpb = val_bpb
         wandb_run.log({
             "step": step,
             "total_training_flops": flops_so_far,
             "total_training_time": total_training_time,
-            "val/nelbo": val_nelbo,
+            "val/loss": val_loss,
+            "val/bpb": val_bpb,
         })
         model.train()
 
@@ -449,7 +451,8 @@ while True:
             optimizer.state_dict(), # optimizer state
             { # metadata saved as json
                 "step": step,
-                "val_nelbo": val_nelbo, # loss at last step
+                "val_loss": val_loss, # val loss at last step
+                "val_bpb": val_bpb, # val bpb at last step
                 "model_config": model_config_kwargs,
                 "user_config": user_config, # inputs to the training script
                 "device_batch_size": args.device_batch_size,
@@ -457,7 +460,7 @@ while True:
                 "total_batch_size": total_batch_size,
                 "dataloader_state_dict": dataloader_state_dict,
                 "loop_state": { # all loop state (other than step) so that we can resume training
-                    "min_val_nelbo": min_val_nelbo,
+                    "min_val_bpb": min_val_bpb,
                     "smooth_train_loss": smooth_train_loss,
                     "total_training_time": total_training_time,
                 },
@@ -567,8 +570,8 @@ while True:
 # print a few more stats
 print0(f"Peak memory usage: {get_max_memory() / 1024 / 1024:.2f}MiB")
 print0(f"Total training time: {total_training_time/60:.2f}m")
-if val_nelbo is not None:
-    print0(f"Minimum validation nelbo: {min_val_nelbo:.6f}")
+if val_bpb is not None:
+    print0(f"Minimum validation bpb: {min_val_bpb:.6f}")
 
 # cleanup
 wandb_run.finish() # wandb run finish
