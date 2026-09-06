@@ -117,16 +117,17 @@ def uniform_gidd_loss(logits, z_t, labels, t, vocab_size, beta_is=1.0, z_loss_st
 def evaluate_loss_bpb(model, batches, steps, vocab_size, token_bytes, beta_is=1.0, z_loss_strength=1e-5, seed=0):
     """
     Validation for the uniform diffusion model. One forward pass per batch gives two numbers:
-    - loss: the training objective (per-token GIDD loss incl. z-loss) averaged over all positions
-      of the validation rows, to be read against train/loss.
-    - bpb: the negative ELBO in bits per byte, an upper bound on the negative log-likelihood and
-      therefore directly comparable to the AR model's val_bpb. Same byte accounting as evaluate_bpb:
+    - loss: the isotropic validation surrogate, using the configured beta_is and z-loss and averaged
+      over all positions. Its noise distribution differs from training when aniso_frac > 0.
+    - bpb: an approximate NELBO estimate in bits per byte, using beta_is=1 and excluding z-loss.
+      Same byte accounting as evaluate_bpb:
       positions whose clean token is a special token carry no bytes and are excluded.
     The NELBO integrand is the per-token GIDD loss divided by t(1-t): for uniform noise, GIDD eq. (13)
     gives the continuous-time NELBO weight 1/((1-t) V q_t(z_t|x)), and the training weight w is
     t(1-t) times that (the "unweighted ELBO" of von Rütte et al. 2026, used by Sumi). The z-loss is
-    a regularizer and not part of the bound; the ELBO constant (reconstruction at T_MIN, prior KL at
-    T_MAX) is of order 1e-4 and dropped, as in the GIDD and Sumi evaluation code.
+    a regularizer and not part of the bound. Endpoint terms (reconstruction at T_MIN, prior KL at
+    T_MAX) are omitted, as in the GIDD and Sumi evaluation code. Their size depends on the predictor,
+    so this truncated estimate is not a guaranteed upper bound on the negative log-likelihood.
     Every row gets one noise level (isotropic). The levels form a seeded, stratified grid over all
     rows this rank evaluates, so the integral over t is covered evenly and the numbers are reproducible.
     """
@@ -150,15 +151,17 @@ def evaluate_loss_bpb(model, batches, steps, vocab_size, token_bytes, beta_is=1.
         t = t_rows[step * B:(step + 1) * B, None].expand(B, T)
         z_t = corrupt(x, t, vocab_size, generator=gen)
         logits = model(z_t) # (B, T, vocab_size) fp32
-        per_token = uniform_gidd_loss(logits, z_t, x, t, vocab_size, beta_is, z_loss_strength=0.0)
-        # training objective (with z-loss) over all positions
+        per_token = uniform_gidd_loss(logits, z_t, x, t, vocab_size, beta_is=1.0, z_loss_strength=0.0)
+        # isotropic validation surrogate with the configured training coefficients
         loss = per_token
+        if beta_is != 1.0:
+            loss = uniform_gidd_loss(logits, z_t, x, t, vocab_size, beta_is=beta_is, z_loss_strength=0.0)
         if z_loss_strength is not None and z_loss_strength > 0.0:
             log_z = torch.logsumexp(logits[..., :vocab_size].float(), dim=-1)
             loss = loss + float(z_loss_strength) * log_z * log_z
         total_loss += loss.sum()
         total_tokens += x.numel()
-        # NELBO: restore the ELBO weight, count nats and bytes of the non-special positions
+        # Approximate NELBO: restore the ELBO weight, count nats and bytes of non-special positions
         nelbo = per_token / (t * (1.0 - t))
         num_bytes = token_bytes[x]
         total_nats += (nelbo * (num_bytes > 0)).sum()

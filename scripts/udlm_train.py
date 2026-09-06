@@ -423,14 +423,14 @@ while True:
     last_step = step == num_iterations # loop runs num_iterations+1 times so that we can eval/save at the end
     flops_so_far = num_flops_per_token * total_batch_size * step
 
-    # once in a while: evaluate the val loss and val bpb (all ranks participate)
+    # once in a while: evaluate the isotropic val surrogate and approximate NELBO bpb (all ranks participate)
     if args.eval_every > 0 and (last_step or step % args.eval_every == 0):
         model.eval()
         val_loader = build_val_loader()
         eval_steps = args.eval_tokens // (args.device_batch_size * args.max_seq_len * ddp_world_size)
         with disable_fp8(model):
             val_loss, val_bpb = udlm.evaluate_loss_bpb(model, val_loader, eval_steps, vocab_size, token_bytes, args.beta_is, args.z_loss_strength)
-        print0(f"Step {step:05d} | Validation loss: {val_loss:.6f} | Validation bpb: {val_bpb:.6f}")
+        print0(f"Step {step:05d} | Isotropic validation loss: {val_loss:.6f} | Approximate NELBO bpb: {val_bpb:.6f}")
         if val_bpb < min_val_bpb:
             min_val_bpb = val_bpb
         wandb_run.log({
