@@ -19,6 +19,8 @@ uniform_gidd_loss is a faithful port of Sumi's reference implementation in
 modeling_sumi.py at https://huggingface.co/tohoku-nlp/sumi-7b (Apache License 2.0).
 """
 
+import math
+
 import torch
 import torch.distributed as dist
 
@@ -41,14 +43,14 @@ def sample_times(shape, device, aniso_frac=0.5):
     return torch.where(aniso, t_tokens, t_seqs)
 
 
-def corrupt(x, t, vocab_size):
+def corrupt(x, t, vocab_size, generator=None):
     """
     Uniform-noise corruption: replace each token with a uniform draw from the vocabulary
     with probability t (alpha = 1 - t is the signal strength). x stays unchanged otherwise.
     Note replacement with the original token can happen by chance (that's correct).
     """
-    replace = torch.rand_like(t) < t
-    noise = torch.randint(0, vocab_size, x.shape, device=x.device)
+    replace = torch.rand(t.shape, device=t.device, generator=generator) < t
+    noise = torch.randint(0, vocab_size, x.shape, device=x.device, generator=generator)
     return torch.where(replace, noise, x)
 
 
@@ -112,26 +114,64 @@ def uniform_gidd_loss(logits, z_t, labels, t, vocab_size, beta_is=1.0, z_loss_st
 
 
 @torch.no_grad()
-def evaluate_nelbo(model, batches, steps, vocab_size, beta_is=1.0, z_loss_strength=1e-5, aniso_frac=0.5):
+def evaluate_loss_bpb(model, batches, steps, vocab_size, token_bytes, beta_is=1.0, z_loss_strength=1e-5, seed=0):
     """
-    Monte Carlo estimate of the validation NELBO (negative ELBO, nats per token): run the
-    training-time corruption on val batches and average the per-token GIDD loss.
-    Mirrors evaluate_bpb's structure (per-rank sums, all-reduce), without byte normalization
-    (diffusion nats/token are not directly comparable to autoregressive bits-per-byte anyway).
+    Validation for the uniform diffusion model. One forward pass per batch gives two numbers:
+    - loss: the isotropic validation surrogate, using the configured beta_is and z-loss and averaged
+      over all positions. Its noise distribution differs from training when aniso_frac > 0.
+    - bpb: an approximate NELBO estimate in bits per byte, using beta_is=1 and excluding z-loss.
+      Same byte accounting as evaluate_bpb:
+      positions whose clean token is a special token carry no bytes and are excluded.
+    The NELBO integrand is the per-token GIDD loss divided by t(1-t): for uniform noise, GIDD eq. (13)
+    gives the continuous-time NELBO weight 1/((1-t) V q_t(z_t|x)), and the training weight w is
+    t(1-t) times that (the "unweighted ELBO" of von Rütte et al. 2026, used by Sumi). The z-loss is
+    a regularizer and not part of the bound. Endpoint terms (reconstruction at T_MIN, prior KL at
+    T_MAX) are omitted, as in the GIDD and Sumi evaluation code. Their size depends on the predictor,
+    so this truncated estimate is not a guaranteed upper bound on the negative log-likelihood.
+    Every row gets one noise level (isotropic). The levels form a seeded, stratified grid over all
+    rows this rank evaluates, so the integral over t is covered evenly and the numbers are reproducible.
     """
-    total_nats = torch.tensor(0.0, dtype=torch.float32, device=model.get_device())
-    total_tokens = torch.tensor(0, dtype=torch.int64, device=model.get_device())
+    device = model.get_device()
+    rank = dist.get_rank() if dist.is_initialized() else 0
+    gen = torch.Generator(device=device).manual_seed(seed + rank)
+    total_loss = torch.tensor(0.0, dtype=torch.float32, device=device)
+    total_tokens = torch.tensor(0, dtype=torch.int64, device=device)
+    total_nats = torch.tensor(0.0, dtype=torch.float32, device=device)
+    total_bytes = torch.tensor(0, dtype=torch.int64, device=device)
+    t_rows = None
     batch_iter = iter(batches)
-    for _ in range(steps):
+    for step in range(steps):
         x, _ = next(batch_iter) # inputs are the clean tokens; the AR-shifted targets are unused
-        t = sample_times(x.size(), x.device, aniso_frac=aniso_frac)
-        z_t = corrupt(x, t, vocab_size)
+        B, T = x.shape
+        if t_rows is None:
+            # one stratum per row, jittered within the stratum, assigned to rows in random order
+            n = steps * B
+            strata = torch.randperm(n, device=device, generator=gen) + torch.rand(n, device=device, generator=gen)
+            t_rows = T_MIN + (T_MAX - T_MIN) * strata / n
+        t = t_rows[step * B:(step + 1) * B, None].expand(B, T)
+        z_t = corrupt(x, t, vocab_size, generator=gen)
         logits = model(z_t) # (B, T, vocab_size) fp32
-        total_nats += uniform_gidd_loss(logits, z_t, x, t, vocab_size, beta_is, z_loss_strength).sum()
+        per_token = uniform_gidd_loss(logits, z_t, x, t, vocab_size, beta_is=1.0, z_loss_strength=0.0)
+        # isotropic validation surrogate with the configured training coefficients
+        loss = per_token
+        if beta_is != 1.0:
+            loss = uniform_gidd_loss(logits, z_t, x, t, vocab_size, beta_is=beta_is, z_loss_strength=0.0)
+        if z_loss_strength is not None and z_loss_strength > 0.0:
+            log_z = torch.logsumexp(logits[..., :vocab_size].float(), dim=-1)
+            loss = loss + float(z_loss_strength) * log_z * log_z
+        total_loss += loss.sum()
         total_tokens += x.numel()
+        # Approximate NELBO: restore the ELBO weight, count nats and bytes of non-special positions
+        nelbo = per_token / (t * (1.0 - t))
+        num_bytes = token_bytes[x]
+        total_nats += (nelbo * (num_bytes > 0)).sum()
+        total_bytes += num_bytes.sum()
     # sum reduce across all ranks
     world_size = dist.get_world_size() if dist.is_initialized() else 1
     if world_size > 1:
-        dist.all_reduce(total_nats, op=dist.ReduceOp.SUM)
-        dist.all_reduce(total_tokens, op=dist.ReduceOp.SUM)
-    return (total_nats / total_tokens.clamp(min=1)).item()
+        for tensor in (total_loss, total_tokens, total_nats, total_bytes):
+            dist.all_reduce(tensor, op=dist.ReduceOp.SUM)
+    loss = (total_loss / total_tokens.clamp(min=1)).item()
+    total_nats, total_bytes = total_nats.item(), total_bytes.item()
+    bpb = total_nats / (math.log(2) * total_bytes) if total_bytes > 0 else float("inf")
+    return loss, bpb

@@ -4,9 +4,12 @@ Test UDLM (uniform diffusion language model) pieces:
 - uniform corruption
 - GIDD loss parity with Sumi's reference implementation + sanity checks
 - bidirectional attention in the GPT model
+- val loss / bpb evaluator: the NELBO of a uniform predictor is log V, and the run is reproducible
 
 Run: python -m pytest tests/test_udlm.py -v -s
 """
+import math
+
 import torch
 import pytest
 
@@ -182,6 +185,49 @@ class TestGiddLoss:
         assert logits.grad is not None
         assert not torch.isnan(logits.grad).any()
         assert logits.grad.abs().sum() > 0
+
+
+# =============================================================================
+# Validation evaluator
+# =============================================================================
+class ZeroLogits(torch.nn.Module):
+    """Stand-in model: uniform predictor (all logits zero), as nanochat's GPT is at init."""
+    def __init__(self, vocab_size, device):
+        super().__init__()
+        self.vocab_size, self.device = vocab_size, torch.device(device)
+
+    def get_device(self):
+        return self.device
+
+    def forward(self, idx):
+        return torch.zeros(*idx.shape, self.vocab_size, device=self.device)
+
+
+class TestEvaluateLossBpb:
+    def _batches(self, B, T, steps, seed=0):
+        g = torch.Generator(device=DEVICE).manual_seed(seed)
+        return [(torch.randint(0, V, (B, T), generator=g, device=DEVICE), None) for _ in range(steps)]
+
+    def test_uniform_predictor_nelbo_is_log_v(self):
+        """A uniform predictor defines the uniform distribution over sequences, so its NELBO per token
+        must come out at log V once the ELBO weight 1/(t(1-t)) is restored; with one byte per token,
+        that is log2(V) bits per byte. The training loss of the same predictor is well below log V."""
+        B, T, steps = 16, 128, 32
+        token_bytes = torch.ones(V, dtype=torch.int64, device=DEVICE)
+        loss, bpb = udlm.evaluate_loss_bpb(ZeroLogits(V, DEVICE), self._batches(B, T, steps), steps, V, token_bytes)
+        print(f"uniform predictor: loss={loss:.4f}, bpb={bpb:.4f}, log2(V)={math.log2(V):.4f}")
+        assert abs(bpb - math.log2(V)) < 0.03 * math.log2(V)
+        assert loss < 0.5 * math.log(V)
+
+    def test_special_tokens_excluded_and_seeded(self):
+        B, T, steps = 4, 64, 4
+        token_bytes = torch.ones(V, dtype=torch.int64, device=DEVICE)
+        token_bytes[:8] = 0  # first 8 ids are "special": no bytes, excluded from the bound
+        a = udlm.evaluate_loss_bpb(ZeroLogits(V, DEVICE), self._batches(B, T, steps), steps, V, token_bytes, seed=3)
+        b = udlm.evaluate_loss_bpb(ZeroLogits(V, DEVICE), self._batches(B, T, steps), steps, V, token_bytes, seed=3)
+        c = udlm.evaluate_loss_bpb(ZeroLogits(V, DEVICE), self._batches(B, T, steps), steps, V, token_bytes, seed=4)
+        assert a == b and a != c
+        assert math.isfinite(a[1]) and a[1] > 0
 
 
 # =============================================================================
